@@ -10,14 +10,18 @@ Pipeline:
       -> Quartz.CGWarpMouseCursorPosition to move the cursor
       -> dwell-to-click via CGEventCreateMouseEvent / CGEventPost
 
-Uses HEAD POSE rather than eye gaze: it is smoother frame-to-frame and needs
-no per-user calibration grid, just a neutral-pose recenter.
+Supports two tracking modes (switch at runtime with 'm' or via --mode):
+    head  HEAD POSE -- smoother frame-to-frame, no per-user calibration grid,
+          just a neutral-pose recenter.
+    eye   IRIS GAZE -- real appearance-based gaze from the iris offset inside
+          each eye; jitterier and lower-resolution, may need calibration.
 
 Keys (in the preview window):
     q      quit
-    c      recenter / recalibrate the neutral head pose
+    c      recenter / recalibrate the neutral for the active mode
     space  toggle cursor control on/off (starts OFF for safety)
     r      toggle webcam recording on/off (local file in debug/)
+    m      toggle tracking mode (head <-> eye)
 
 Debug artifacts (written to debug/):
     --record         start webcam recording immediately (also key 'r')
@@ -51,6 +55,20 @@ CAMERA_INDEX = 0
 
 GAIN_X = 4.0          # screen-x sensitivity to yaw (radians -> fraction of width)
 GAIN_Y = 4.0          # screen-y sensitivity to pitch (radians -> fraction of height)
+
+# Eye-gaze sensitivity. The iris offset signal lives in a small ~[-1, 1] range
+# with a much narrower usable span than head pose, so gains are larger. Tuning
+# knobs: raise to reach the screen edges with less eye travel, lower to calm
+# jitter (eye mode is inherently jitterier than head mode).
+EYE_GAIN_X = 6.0      # screen-x sensitivity to horizontal iris offset
+EYE_GAIN_Y = 6.0      # screen-y sensitivity to vertical iris offset
+
+# Iris/eye landmark indices in the 478-point FaceLandmarker mesh.
+# (outer_corner, inner_corner, upper_lid, lower_lid, iris_center)
+LEFT_EYE_IDX = (33, 133, 159, 145, 468)
+RIGHT_EYE_IDX = (263, 362, 386, 374, 473)
+
+BBOX_MARGIN = 0.04    # face bounding box margin as a fraction of its size
 
 DWELL_TIME = 0.8      # seconds the cursor must stay still to fire a click
 DWELL_RADIUS = 30     # px radius that counts as "still"
@@ -377,6 +395,96 @@ def clamp(value: float, lo: float, hi: float) -> float:
 
 
 # --------------------------------------------------------------------------- #
+# Eye-gaze math
+# --------------------------------------------------------------------------- #
+_eye_gaze_warn_last = 0.0
+
+
+def _eye_ratio(landmarks, idx: tuple) -> tuple[float, float] | None:
+    """Normalized (horizontal, vertical) iris offset for one eye, or None.
+
+    Horizontal: where the iris center sits between inner and outer corner,
+    re-centered so ~0 means looking straight ahead. Vertical: where the iris
+    center sits between the upper and lower eyelid, re-centered to ~0.
+    Returns None if a landmark is missing or the eye span is degenerate.
+    """
+    outer_i, inner_i, upper_i, lower_i, iris_i = idx
+    try:
+        outer = landmarks[outer_i]
+        inner = landmarks[inner_i]
+        upper = landmarks[upper_i]
+        lower = landmarks[lower_i]
+        iris = landmarks[iris_i]
+    except (IndexError, TypeError, KeyError):
+        return None
+
+    width = outer.x - inner.x
+    height = lower.y - upper.y
+    if abs(width) < 1e-6 or abs(height) < 1e-6:
+        return None
+
+    # Fraction of the eye span (0 at inner, 1 at outer), re-centered to ~0.
+    h_ratio = (iris.x - inner.x) / width - 0.5
+    v_ratio = (iris.y - upper.y) / height - 0.5
+    # Scale [-0.5, 0.5] span to roughly [-1, 1].
+    return h_ratio * 2.0, v_ratio * 2.0
+
+
+def eye_gaze_from_landmarks(landmarks) -> tuple[float, float]:
+    """Appearance-based gaze as a normalized iris offset, averaged over eyes.
+
+    `landmarks` is the normalized landmark list for face 0 (each item exposing
+    .x/.y in [0, 1]). Returns (gaze_x, gaze_y) in roughly [-1, 1] each, where
+    (0, 0) is looking center. Degrades gracefully (returns the available eye,
+    or (0.0, 0.0) if neither eye is usable) and logs a throttled warning.
+    """
+    left = _eye_ratio(landmarks, LEFT_EYE_IDX)
+    right = _eye_ratio(landmarks, RIGHT_EYE_IDX)
+
+    usable = [e for e in (left, right) if e is not None]
+    if not usable:
+        global _eye_gaze_warn_last
+        now = time.time()
+        if now - _eye_gaze_warn_last >= PERIODIC_LOG_INTERVAL:
+            _eye_gaze_warn_last = now
+            log.warning("Eye-gaze landmarks unavailable; gaze falling back to 0")
+        return 0.0, 0.0
+
+    gaze_x = sum(e[0] for e in usable) / len(usable)
+    gaze_y = sum(e[1] for e in usable) / len(usable)
+    return gaze_x, gaze_y
+
+
+def face_bbox_from_landmarks(
+    landmarks, frame_w: int, frame_h: int
+) -> tuple[int, int, int, int]:
+    """Pixel-space face bounding box (x, y, w, h) over all landmarks.
+
+    Min/max over normalized landmark x/y, expanded by BBOX_MARGIN and clamped
+    to the frame. Returns (0, 0, 0, 0) if there are no landmarks.
+    """
+    xs = [lm.x for lm in landmarks]
+    ys = [lm.y for lm in landmarks]
+    if not xs or not ys:
+        return 0, 0, 0, 0
+
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
+    mx = (max_x - min_x) * BBOX_MARGIN
+    my = (max_y - min_y) * BBOX_MARGIN
+
+    x0 = clamp((min_x - mx) * frame_w, 0, frame_w - 1)
+    y0 = clamp((min_y - my) * frame_h, 0, frame_h - 1)
+    x1 = clamp((max_x + mx) * frame_w, 0, frame_w - 1)
+    y1 = clamp((max_y + my) * frame_h, 0, frame_h - 1)
+
+    x, y = int(x0), int(y0)
+    w = max(0, int(x1) - x)
+    h = max(0, int(y1) - y)
+    return x, y, w, h
+
+
+# --------------------------------------------------------------------------- #
 # Model
 # --------------------------------------------------------------------------- #
 def ensure_model() -> str:
@@ -416,8 +524,10 @@ class GazeMouse:
         show_window: bool,
         record: bool = False,
         trace: bool = False,
+        mode: str = "head",
     ) -> None:
         self.show_window = show_window
+        self.mode = mode  # "head" or "eye"
         self.screen_w, self.screen_h = get_screen_size()
 
         # debug recording / tracing
@@ -432,6 +542,8 @@ class GazeMouse:
 
         self.neutral_yaw = 0.0
         self.neutral_pitch = 0.0
+        self.neutral_gaze_x = 0.0
+        self.neutral_gaze_y = 0.0
         self.calibrated = False
 
         self.control_enabled = False  # OFF for safety until the user opts in
@@ -449,15 +561,35 @@ class GazeMouse:
         self.running = True
 
     # -- calibration ------------------------------------------------------- #
-    def recenter(self, yaw: float, pitch: float) -> None:
-        self.neutral_yaw = yaw
-        self.neutral_pitch = pitch
+    def recenter(
+        self, yaw: float, pitch: float, gaze_x: float, gaze_y: float
+    ) -> None:
+        """Set the neutral for the currently active mode.
+
+        Both signals are stored so switching modes preserves each neutral, but
+        only the active mode's neutral is updated from this frame's reading.
+        """
+        if self.mode == "eye":
+            self.neutral_gaze_x = gaze_x
+            self.neutral_gaze_y = gaze_y
+            log.info(
+                "Recentered neutral gaze: gaze_x=%.3f gaze_y=%.3f", gaze_x, gaze_y
+            )
+        else:
+            self.neutral_yaw = yaw
+            self.neutral_pitch = pitch
+            log.info(
+                "Recentered neutral pose: yaw=%.3f pitch=%.3f rad", yaw, pitch
+            )
         self.calibrated = True
         self.filter_x = OneEuroFilter()
         self.filter_y = OneEuroFilter()
-        log.info(
-            "Recentered neutral pose: yaw=%.3f pitch=%.3f rad", yaw, pitch
-        )
+
+    def toggle_mode(self) -> None:
+        self.mode = "eye" if self.mode == "head" else "head"
+        self.filter_x = OneEuroFilter()
+        self.filter_y = OneEuroFilter()
+        log.info("Tracking mode switched to %s", self.mode.upper())
 
     def toggle_control(self) -> None:
         self.control_enabled = not self.control_enabled
@@ -482,6 +614,22 @@ class GazeMouse:
         nx = 0.5 + dyaw * GAIN_X
         # pitch: looking down (positive) should move cursor down.
         ny = 0.5 + dpitch * GAIN_Y
+
+        x = clamp(nx, 0.0, 1.0) * (self.screen_w - 1)
+        y = clamp(ny, 0.0, 1.0) * (self.screen_h - 1)
+        return x, y
+
+    def gaze_to_screen(self, gaze_x: float, gaze_y: float) -> tuple[float, float]:
+        """Map an iris-gaze offset to a clamped screen point.
+
+        Same neutral + gain + clamp pipeline as head pose, just a different
+        source signal and gain constants.
+        """
+        dx = gaze_x - self.neutral_gaze_x
+        dy = gaze_y - self.neutral_gaze_y
+
+        nx = 0.5 + dx * EYE_GAIN_X
+        ny = 0.5 + dy * EYE_GAIN_Y
 
         x = clamp(nx, 0.0, 1.0) * (self.screen_w - 1)
         y = clamp(ny, 0.0, 1.0) * (self.screen_h - 1)
@@ -554,7 +702,8 @@ class GazeMouse:
             cv2.circle(frame, face_xy, 5, (0, 255, 0), -1)
 
         line = (
-            f"fps {self._fps:4.1f} | yaw {math.degrees(yaw):+5.1f} "
+            f"fps {self._fps:4.1f} | mode {self.mode.upper():4s} | "
+            f"yaw {math.degrees(yaw):+5.1f} "
             f"pitch {math.degrees(pitch):+5.1f} | "
             f"ctrl {'ON' if self.control_enabled else 'OFF'} | "
             f"dwell {int(progress * 100):3d}%"
@@ -563,7 +712,7 @@ class GazeMouse:
             frame, line, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
             (0, 255, 255), 2, cv2.LINE_AA,
         )
-        hint = "q quit  c recenter  space toggle  r record"
+        hint = "q quit  c recenter  space toggle  r record  m mode"
         cv2.putText(
             frame, hint, (10, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
             (200, 200, 200), 1, cv2.LINE_AA,
@@ -572,6 +721,38 @@ class GazeMouse:
         bar_w = int(progress * (w - 20))
         cv2.rectangle(frame, (10, h - 40), (10 + bar_w, h - 30),
                       (0, 200, 0), -1)
+
+    def draw_face_overlay(
+        self, frame: np.ndarray, landmarks, cam_w: int, cam_h: int
+    ) -> None:
+        """Draw the face bounding box, plus eye markers in eye mode."""
+        x, y, bw, bh = face_bbox_from_landmarks(landmarks, cam_w, cam_h)
+        if bw > 0 and bh > 0:
+            cv2.rectangle(
+                frame, (x, y), (x + bw, y + bh), (255, 200, 0), 1, cv2.LINE_AA
+            )
+
+        if self.mode != "eye":
+            return
+
+        def px(i: int) -> tuple[int, int] | None:
+            try:
+                lm = landmarks[i]
+            except (IndexError, TypeError, KeyError):
+                return None
+            return int(lm.x * cam_w), int(lm.y * cam_h)
+
+        # Eye corners (upper/lower lid + corners) as small markers.
+        for idx in LEFT_EYE_IDX[:4] + RIGHT_EYE_IDX[:4]:
+            p = px(idx)
+            if p is not None:
+                cv2.circle(frame, p, 2, (0, 255, 255), 1, cv2.LINE_AA)
+
+        # Iris centers as filled dots.
+        for idx in (LEFT_EYE_IDX[4], RIGHT_EYE_IDX[4]):
+            p = px(idx)
+            if p is not None:
+                cv2.circle(frame, p, 3, (0, 0, 255), -1, cv2.LINE_AA)
 
     # -- main loop --------------------------------------------------------- #
     def run(self) -> None:
@@ -612,11 +793,20 @@ class GazeMouse:
 
                 self.frame_idx += 1
                 yaw = pitch = 0.0
+                gaze_x = gaze_y = 0.0
+                have_gaze = False
                 cursor: tuple[float, float] | None = None
                 target: tuple[float, float] | None = None
                 progress = 0.0
                 clicked = False
                 face_xy: tuple[int, int] | None = None
+                landmarks = (
+                    result.face_landmarks[0] if result.face_landmarks else None
+                )
+
+                if landmarks is not None:
+                    gaze_x, gaze_y = eye_gaze_from_landmarks(landmarks)
+                    have_gaze = True
 
                 if result.facial_transformation_matrixes:
                     matrix = np.array(
@@ -625,13 +815,16 @@ class GazeMouse:
                     yaw, pitch = yaw_pitch_from_matrix(matrix)
 
                     if not self.calibrated:
-                        self.recenter(yaw, pitch)
+                        self.recenter(yaw, pitch, gaze_x, gaze_y)
 
-                    if result.face_landmarks:
-                        nose = result.face_landmarks[0][1]
+                    if landmarks is not None:
+                        nose = landmarks[1]
                         face_xy = (int(nose.x * cam_w), int(nose.y * cam_h))
 
-                    raw_x, raw_y = self.pose_to_screen(yaw, pitch)
+                    if self.mode == "eye":
+                        raw_x, raw_y = self.gaze_to_screen(gaze_x, gaze_y)
+                    else:
+                        raw_x, raw_y = self.pose_to_screen(yaw, pitch)
                     target = (raw_x, raw_y)
                     sx = self.filter_x(raw_x, now)
                     sy = self.filter_y(raw_y, now)
@@ -648,6 +841,8 @@ class GazeMouse:
                 # so it is built even in --no-window mode when recording.
                 annotate = self.show_window or self.recorder is not None
                 if annotate:
+                    if landmarks is not None:
+                        self.draw_face_overlay(frame, landmarks, cam_w, cam_h)
                     self.draw_hud(frame, yaw, pitch, cursor, progress, face_xy)
                     draw_minimap(
                         frame, self.screen_w, self.screen_h,
@@ -662,8 +857,11 @@ class GazeMouse:
                         "t": now,
                         "frame": self.frame_idx,
                         "fps": round(self._fps, 2),
+                        "mode": self.mode,
                         "yaw": round(yaw, 5),
                         "pitch": round(pitch, 5),
+                        "gaze_x": round(gaze_x, 5) if have_gaze else None,
+                        "gaze_y": round(gaze_y, 5) if have_gaze else None,
                         "target_x": round(target[0], 1) if target else None,
                         "target_y": round(target[1], 1) if target else None,
                         "cursor_x": round(cursor[0], 1) if cursor else None,
@@ -680,11 +878,13 @@ class GazeMouse:
                         log.info("Quit requested (q)")
                         break
                     if key == ord("c") and result.facial_transformation_matrixes:
-                        self.recenter(yaw, pitch)
+                        self.recenter(yaw, pitch, gaze_x, gaze_y)
                     if key == ord(" "):
                         self.toggle_control()
                     if key == ord("r"):
                         self.toggle_recording()
+                    if key == ord("m"):
+                        self.toggle_mode()
         finally:
             cap.release()
             if self.show_window:
@@ -721,6 +921,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--trace", action="store_true",
         help="write a per-frame JSONL trace to debug/trace-*.jsonl",
     )
+    parser.add_argument(
+        "--mode", choices=("head", "eye"), default="head",
+        help="tracking source: head pose (default) or iris gaze",
+    )
     return parser.parse_args(argv)
 
 
@@ -729,10 +933,11 @@ def main(argv: list[str] | None = None) -> int:
     setup_logging(args.debug)
 
     log.info(
-        "Startup config: gain=(%.1f, %.1f) dwell=%.2fs/%.0fpx "
-        "one_euro=(min_cutoff=%.2f, beta=%.3f) camera=%d window=%s debug=%s "
-        "record=%s trace=%s",
-        GAIN_X, GAIN_Y, DWELL_TIME, DWELL_RADIUS, MIN_CUTOFF, BETA,
+        "Startup config: mode=%s gain=(%.1f, %.1f) eye_gain=(%.1f, %.1f) "
+        "dwell=%.2fs/%.0fpx one_euro=(min_cutoff=%.2f, beta=%.3f) "
+        "camera=%d window=%s debug=%s record=%s trace=%s",
+        args.mode, GAIN_X, GAIN_Y, EYE_GAIN_X, EYE_GAIN_Y,
+        DWELL_TIME, DWELL_RADIUS, MIN_CUTOFF, BETA,
         CAMERA_INDEX, not args.no_window, args.debug,
         args.record, args.trace,
     )
@@ -741,6 +946,7 @@ def main(argv: list[str] | None = None) -> int:
         show_window=not args.no_window,
         record=args.record,
         trace=args.trace,
+        mode=args.mode,
     )
 
     def handle_sigint(_signum, _frame):
