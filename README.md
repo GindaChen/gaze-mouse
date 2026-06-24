@@ -16,6 +16,45 @@ Two tracking modes, switchable at runtime (`m`) or at launch (`--mode`):
   the raw iris offset is fitted to your screen with a per-user model (see
   below), replacing the flat gain mapping.
 
+## Engines
+
+The per-frame gaze can come from one of two engines, selected at launch with
+`--engine` (default `builtin`):
+
+- **builtin** (default) — the MediaPipe FaceLandmarker pipeline described above
+  (head pose + iris gaze, with the 9-point calibration). This code and its
+  dependencies are **MIT**.
+- **eyegestures** — the third-party
+  [eyeGestures](https://github.com/NativeSensors/EyeGestures) appearance-based
+  tracker. Its `EyeGestures_v3.step()` supplies the screen point each frame,
+  fed through the **same** downstream as builtin (One-Euro smoothing, screen
+  clamp, cursor warp, dwell-click, minimap/HUD, the JSONL trace, snapshots, the
+  recorder and `meta.json`).
+
+```sh
+.venv/bin/python gaze_mouse.py                       # builtin (MIT), default
+.venv/bin/python gaze_mouse.py --engine eyegestures  # eyeGestures (GPLv3)
+```
+
+> **License note — eyeGestures is GPLv3.** Selecting `--engine eyegestures`
+> pulls in a **GPLv3** dependency (eyeGestures, plus scikit-learn). The GPLv3 is
+> copyleft: if you distribute a combined work that links against eyeGestures,
+> that combined work must itself be offered under the GPLv3 and its source made
+> available. The **builtin** engine and the rest of this project stay **MIT** —
+> eyeGestures is **optional** and **lazy-imported only when `--engine
+> eyegestures` is selected**, so the builtin (MIT) path runs even when
+> eyeGestures and scikit-learn are not installed. To stay fully MIT, use only
+> the builtin engine and do not install eyeGestures.
+
+In the eyeGestures engine, calibration uses the **library's own** routine: a
+normalized 5×5 grid is uploaded and the tracker walks one fixation target at a
+time. Pass `--calibrate` (or press `k` in the preview) to (re)run it; the active
+calibration target is drawn in the preview as a red dot with eyeGestures'
+acceptance ring, then control flips to live tracking once the grid is exhausted.
+Per-frame face bounding box and iris dots are not drawn in this engine (the
+library does not expose a matching landmark list); the minimap, dwell ring and
+HUD still draw, and the HUD shows the active engine.
+
 ## Eye-gaze calibration
 
 The raw iris offset alone does not reach screen corners reliably. A one-time
@@ -57,6 +96,7 @@ Grant both to the terminal/Python that runs this, in
 .venv/bin/python gaze_mouse.py --record      # also record recording.mp4 in the session
 .venv/bin/python gaze_mouse.py --no-snapshots # disable periodic + on-click snapshots
 .venv/bin/python gaze_mouse.py --snap-interval 5 # seconds between periodic snapshots
+.venv/bin/python gaze_mouse.py --engine eyegestures # use the GPLv3 eyeGestures engine
 .venv/bin/python gaze_mouse.py --mode eye    # start in iris-gaze mode (default: head)
 .venv/bin/python gaze_mouse.py --calibrate   # run 9-point eye calibration first
 .venv/bin/python gaze_mouse.py --no-calib    # ignore saved eye calibration profile
@@ -135,6 +175,7 @@ Smoke-test the pure helpers without a camera:
 .venv/bin/python tests/smoke_eye.py      # eye-gaze + face-bbox math
 .venv/bin/python tests/smoke_calib.py    # calibration fit/predict math
 .venv/bin/python tests/smoke_session.py  # per-session folder + snapshots + meta
+.venv/bin/python tests/smoke_engine.py   # --engine flag, lazy import, eyeGestures ctor
 ```
 
 ## Tuning knobs (top of `gaze_mouse.py`)

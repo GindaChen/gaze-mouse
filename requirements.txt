@@ -1,4 +1,9 @@
-mediapipe>=0.10.14
+mediapipe==0.10.14
 opencv-python>=4.8
 pyobjc-framework-Quartz>=10.0
 numpy>=1.24
+
+# Only needed for `--engine eyegestures` (the optional GPLv3 gaze engine).
+# The builtin engine stays MIT and does not require these.
+eyeGestures
+scikit-learn

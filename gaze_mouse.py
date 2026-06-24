@@ -16,6 +16,15 @@ Supports two tracking modes (switch at runtime with 'm' or via --mode):
     eye   IRIS GAZE -- real appearance-based gaze from the iris offset inside
           each eye; jitterier and lower-resolution, may need calibration.
 
+Two gaze ENGINES (select at launch with --engine):
+    builtin     (default) the MediaPipe FaceLandmarker pipeline above. MIT.
+    eyegestures the third-party eyeGestures appearance-based tracker; its
+                EyeGestures_v3.step() supplies the per-frame screen point,
+                fed through the same smoothing / dwell / recording downstream.
+                NOTE: eyeGestures is GPLv3; selecting this engine pulls in a
+                GPLv3 dependency. It is lazy-imported only when requested so
+                the builtin (MIT) path runs without it installed.
+
 Keys (in the preview window):
     q      quit
     c      recenter / recalibrate the neutral for the active mode
@@ -54,6 +63,19 @@ import Quartz
 # Config constants
 # --------------------------------------------------------------------------- #
 CAMERA_INDEX = 0
+
+# Gaze engines. "builtin" is the MediaPipe FaceLandmarker pipeline (MIT).
+# "eyegestures" delegates the per-frame screen point to the third-party
+# EyeGestures_v3 tracker (GPLv3, lazy-imported only when selected).
+ENGINE_BUILTIN = "builtin"
+ENGINE_EYEGESTURES = "eyegestures"
+ENGINES = (ENGINE_BUILTIN, ENGINE_EYEGESTURES)
+
+# eyeGestures engine knobs. calibration_radius drives how tight the lib's
+# acceptance ring gets; the NxM grid of normalized [0,1] points is what the
+# tracker walks through during calibration (one fixation target at a time).
+EYEGESTURES_CALIB_RADIUS = 1000
+EYEGESTURES_GRID = (5, 5)   # columns x rows of normalized calibration targets
 
 GAIN_X = 4.0          # screen-x sensitivity to yaw (radians -> fraction of width)
 GAIN_Y = 4.0          # screen-y sensitivity to pitch (radians -> fraction of height)
@@ -665,6 +687,45 @@ def load_calibration() -> dict | None:
     return model
 
 
+def build_eyegestures():
+    """Construct an EyeGestures_v3 tracker, importing the library lazily.
+
+    eyeGestures is GPLv3 and optional: it is imported here, only when the
+    eyegestures engine is selected, so the MIT builtin path runs even if the
+    library (and its sklearn dependency) is not installed. On import failure we
+    log a clear, actionable error and re-raise so the caller can exit cleanly.
+    """
+    try:
+        from eyeGestures import EyeGestures_v3
+    except ImportError as exc:
+        log.error(
+            "eyeGestures engine requested but the library failed to import: %s. "
+            "Install it (and scikit-learn) into the venv, or use "
+            "--engine builtin.",
+            exc,
+        )
+        raise
+    g = EyeGestures_v3(calibration_radius=EYEGESTURES_CALIB_RADIUS)
+    return g
+
+
+def eyegestures_grid(cols: int, rows: int) -> list[list[float]]:
+    """Normalized NxM calibration grid of [0,1] points the tracker walks.
+
+    Row-major list of [x, y] in [0, 1]. Uploaded via uploadCalibrationMap; the
+    tracker advances one target at a time as the user fixates each in turn.
+    """
+    if cols < 2 or rows < 2:
+        raise ValueError("calibration grid needs at least 2x2 points")
+    grid = []
+    for r in range(rows):
+        fy = r / (rows - 1)
+        for c in range(cols):
+            fx = c / (cols - 1)
+            grid.append([fx, fy])
+    return grid
+
+
 def build_landmarker():
     """Create a MediaPipe FaceLandmarker in VIDEO mode with transform output."""
     from mediapipe.tasks import python as mp_python
@@ -697,9 +758,11 @@ class GazeMouse:
         calibrate_on_start: bool = False,
         snapshots: bool = True,
         snap_interval: float = DEFAULT_SNAP_INTERVAL,
+        engine: str = ENGINE_BUILTIN,
     ) -> None:
         self.session = session
         self.show_window = show_window
+        self.engine = engine  # "builtin" or "eyegestures"
         self.mode = mode  # "head" or "eye"
         self.screen_w, self.screen_h = get_screen_size()
         self.start_wall = time.time()
@@ -729,6 +792,7 @@ class GazeMouse:
         # Flags recorded into meta.json. Set by main() before run().
         self.flags: dict = {
             "window": show_window,
+            "engine": engine,
             "record": record,
             "mode": mode,
             "use_calib": use_calib,
@@ -926,13 +990,14 @@ class GazeMouse:
             cv2.circle(frame, face_xy, 5, (0, 255, 0), -1)
 
         line = (
-            f"fps {self._fps:4.1f} | mode {self.mode.upper():4s} | "
+            f"fps {self._fps:4.1f} | eng {self.engine[:3].upper()} | "
+            f"mode {self.mode.upper():4s} | "
             f"yaw {math.degrees(yaw):+5.1f} "
             f"pitch {math.degrees(pitch):+5.1f} | "
             f"ctrl {'ON' if self.control_enabled else 'OFF'} | "
             f"dwell {int(progress * 100):3d}%"
         )
-        if self.mode == "eye":
+        if self.engine == ENGINE_BUILTIN and self.mode == "eye":
             line += f" | calib {'on' if self.calib_active() else 'off'}"
         line += f" | snap {'on' if self.snapshots_enabled else 'off'}"
         cv2.putText(
@@ -1123,6 +1188,13 @@ class GazeMouse:
 
     # -- main loop --------------------------------------------------------- #
     def run(self) -> None:
+        """Dispatch to the selected engine's capture loop."""
+        if self.engine == ENGINE_EYEGESTURES:
+            self.run_eyegestures()
+        else:
+            self.run_builtin()
+
+    def run_builtin(self) -> None:
         landmarker = build_landmarker()
         from mediapipe import Image, ImageFormat
 
@@ -1243,6 +1315,7 @@ class GazeMouse:
                         "t": now,
                         "frame": self.frame_idx,
                         "fps": round(self._fps, 2),
+                        "engine": self.engine,
                         "mode": self.mode,
                         "yaw": round(yaw, 5),
                         "pitch": round(pitch, 5),
@@ -1289,6 +1362,247 @@ class GazeMouse:
             landmarker.close()
             log.info("Shut down cleanly")
 
+    # -- eyeGestures engine ------------------------------------------------ #
+    def _eyegestures_target(self, event) -> tuple[float, float]:
+        """Clamp an EyeGestures step event's screen point to the display."""
+        px = float(event.point[0])
+        py = float(event.point[1])
+        x = clamp(px, 0.0, self.screen_w - 1)
+        y = clamp(py, 0.0, self.screen_h - 1)
+        return x, y
+
+    def run_eyegestures(self) -> None:
+        """Capture loop backed by the third-party eyeGestures tracker (GPLv3).
+
+        The per-frame screen point comes from EyeGestures_v3.step() instead of
+        the FaceLandmarker pipeline, then flows through the SAME downstream as
+        the builtin engine: One-Euro smoothing, screen clamp, cursor warp,
+        dwell-click, minimap/HUD overlays, the JSONL trace, snapshots, the
+        recorder and meta.json.
+        """
+        try:
+            tracker = build_eyegestures()
+        except ImportError:
+            return  # build_eyegestures already logged an actionable error
+
+        grid = eyegestures_grid(*EYEGESTURES_GRID)
+        tracker.uploadCalibrationMap(grid)
+        self._eg_grid_len = len(grid)
+
+        cap = cv2.VideoCapture(CAMERA_INDEX)
+        if not cap.isOpened():
+            log.error("Failed to open camera index %d", CAMERA_INDEX)
+            return
+
+        cam_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        cam_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        log.info("Camera opened: %dx%d", cam_w, cam_h)
+        log.info("Screen size: %.0fx%.0f", self.screen_w, self.screen_h)
+        log.info("Session folder: %s", self.session.dir)
+        log.info("Engine: eyeGestures (GPLv3, grid %dx%d)", *EYEGESTURES_GRID)
+        log.info("Cursor control starts OFF; press space to enable.")
+
+        self.tracer = Tracer(self.session.trace_path)
+        if self.record_requested:
+            self.recorder = Recorder(self.session.recording_path, fps=None)
+        if self.snapshots_enabled:
+            self.snapshotter = Snapshotter(
+                self.session.frames_dir, interval=self.snap_interval
+            )
+
+        # When --calibrate is passed, start in calibration; the grid is walked
+        # in-loop so all recording features stay live during calibration too.
+        self._eg_calibrating = bool(self.calibrate_on_start)
+        self._eg_calib_seen = 0
+        self._eg_last_calib_pt: tuple[int, int] | None = None
+        if self._eg_calibrating:
+            log.info(
+                "eyeGestures calibration started: walking %d targets", len(grid)
+            )
+
+        try:
+            while self.running:
+                ok, frame = cap.read()
+                if not ok:
+                    log.warning("Dropped frame from camera")
+                    continue
+
+                frame = cv2.flip(frame, 1)  # mirror for natural movement
+                now = time.time()
+                self.update_fps(now)
+
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                self.frame_idx += 1
+
+                target: tuple[float, float] | None = None
+                cursor: tuple[float, float] | None = None
+                calib_target: tuple[float, float] | None = None
+                calib_radius = 0.0
+                progress = 0.0
+                clicked = False
+
+                try:
+                    event, calibration = tracker.step(
+                        rgb, self._eg_calibrating,
+                        int(self.screen_w), int(self.screen_h),
+                    )
+                except Exception:  # noqa: BLE001 - a bad frame must not kill the loop
+                    log.exception("eyeGestures step failed on this frame")
+                    event, calibration = None, None
+
+                if calibration is not None:
+                    try:
+                        calib_target = (
+                            float(calibration.point[0]),
+                            float(calibration.point[1]),
+                        )
+                        calib_radius = float(calibration.acceptance_radius)
+                    except (TypeError, IndexError, AttributeError):
+                        calib_target = None
+
+                if self._eg_calibrating and calib_target is not None:
+                    # Count distinct calibration targets as the tracker advances
+                    # through the grid; finish once all have been visited.
+                    pt_key = (int(calib_target[0]), int(calib_target[1]))
+                    if pt_key != self._eg_last_calib_pt:
+                        self._eg_last_calib_pt = pt_key
+                        self._eg_calib_seen += 1
+                        log.info(
+                            "eyeGestures calibration target %d/%d at (%d, %d)",
+                            self._eg_calib_seen, self._eg_grid_len,
+                            pt_key[0], pt_key[1],
+                        )
+                    if self._eg_calib_seen > self._eg_grid_len:
+                        self._eg_calibrating = False
+                        log.info(
+                            "eyeGestures calibration finished; live tracking on"
+                        )
+
+                if event is not None and not self._eg_calibrating:
+                    raw_x, raw_y = self._eyegestures_target(event)
+                    target = (raw_x, raw_y)
+                    sx = self.filter_x(raw_x, now)
+                    sy = self.filter_y(raw_y, now)
+                    cursor = (sx, sy)
+
+                    if self.control_enabled:
+                        warp_cursor(sx, sy)
+                    progress, clicked = self.update_dwell(sx, sy, now)
+                    self.periodic_log(now, 0.0, 0.0, sx, sy)
+
+                # Annotate (HUD + minimap + calibration target). Face bbox / iris
+                # dots are skipped here: the lib does not expose a matching
+                # landmark list, so we simply do not draw them.
+                annotate = (
+                    self.show_window
+                    or self.recorder is not None
+                    or self.snapshotter is not None
+                )
+                if annotate:
+                    self.draw_hud(frame, 0.0, 0.0, cursor, progress, None)
+                    if self._eg_calibrating and calib_target is not None:
+                        self._draw_eg_calib_target(
+                            frame, cam_w, cam_h, calib_target, calib_radius
+                        )
+                    draw_minimap(
+                        frame, self.screen_w, self.screen_h,
+                        target, cursor, progress,
+                    )
+
+                if self.recorder is not None:
+                    self.recorder.write(frame)
+
+                if self.snapshotter is not None:
+                    if clicked:
+                        self.snapshotter.on_click(frame, now)
+                    self.snapshotter.maybe_periodic(frame, now)
+
+                if self.tracer is not None:
+                    self.tracer.write({
+                        "t": now,
+                        "frame": self.frame_idx,
+                        "fps": round(self._fps, 2),
+                        "engine": self.engine,
+                        "mode": self.mode,
+                        "yaw": 0.0,
+                        "pitch": 0.0,
+                        "gaze_x": None,
+                        "gaze_y": None,
+                        "target_x": round(target[0], 1) if target else None,
+                        "target_y": round(target[1], 1) if target else None,
+                        "cursor_x": round(cursor[0], 1) if cursor else None,
+                        "cursor_y": round(cursor[1], 1) if cursor else None,
+                        "calibrating": self._eg_calibrating,
+                        "dwell": round(progress, 3),
+                        "control_on": self.control_enabled,
+                        "click": clicked,
+                    })
+
+                if self.show_window:
+                    cv2.imshow("gaze-mouse", frame)
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == ord("q"):
+                        log.info("Quit requested (q)")
+                        break
+                    if key == ord(" "):
+                        self.toggle_control()
+                    if key == ord("r"):
+                        self.toggle_recording()
+                    if key == ord("k"):
+                        # Restart the lib's built-in calibration from the grid.
+                        tracker.reset()
+                        self._eg_calibrating = True
+                        self._eg_calib_seen = 0
+                        self._eg_last_calib_pt = None
+                        self.filter_x = OneEuroFilter()
+                        self.filter_y = OneEuroFilter()
+                        log.info(
+                            "eyeGestures calibration started: walking %d targets",
+                            self._eg_grid_len,
+                        )
+        finally:
+            cap.release()
+            if self.show_window:
+                cv2.destroyAllWindows()
+            if self.recorder is not None:
+                self.recorder.close()
+                self.recorder = None
+            if self.tracer is not None:
+                self.tracer.close()
+                self.tracer = None
+            if self.snapshotter is not None:
+                self.snapshotter.close()
+            self.write_meta()
+            log.info("Shut down cleanly")
+
+    def _draw_eg_calib_target(
+        self,
+        frame: np.ndarray,
+        cam_w: int,
+        cam_h: int,
+        calib_target: tuple[float, float],
+        calib_radius: float,
+    ) -> None:
+        """Draw eyeGestures' active calibration point onto the preview frame.
+
+        The target is in screen pixels; map it into the camera frame so it is
+        visible in the preview window (and recorded / snapshotted). The
+        acceptance radius is scaled by the same factor.
+        """
+        if self.screen_w <= 0 or self.screen_h <= 0:
+            return
+        sx = cam_w / self.screen_w
+        sy = cam_h / self.screen_h
+        cx = int(clamp(calib_target[0] * sx, 0, cam_w - 1))
+        cy = int(clamp(calib_target[1] * sy, 0, cam_h - 1))
+        ring = max(6, int(calib_radius * min(sx, sy)))
+        cv2.circle(frame, (cx, cy), ring, (0, 220, 0), 1, cv2.LINE_AA)
+        cv2.circle(frame, (cx, cy), 8, (0, 0, 255), -1, cv2.LINE_AA)
+        cv2.putText(
+            frame, "calibrating: look at the red dot", (10, 50),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 220, 0), 2, cv2.LINE_AA,
+        )
+
     # -- meta -------------------------------------------------------------- #
     def write_meta(self) -> str:
         """Write meta.json summarizing the session. Idempotent and crash-safe."""
@@ -1306,6 +1620,7 @@ class GazeMouse:
             "mean_fps": round(mean_fps, 2),
             "screen_w": int(self.screen_w),
             "screen_h": int(self.screen_h),
+            "engine": self.engine,
             "modes_used": sorted(self.modes_used),
             "calibration_active": self.calib_active(),
             "calibration_points": (
@@ -1355,6 +1670,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="seconds between periodic camera snapshots (default: %(default)s)",
     )
     parser.add_argument(
+        "--engine", choices=ENGINES, default=ENGINE_BUILTIN,
+        help=(
+            "gaze engine: builtin MediaPipe pipeline (default, MIT) or "
+            "eyegestures (GPLv3, lazy-imported only when selected)"
+        ),
+    )
+    parser.add_argument(
         "--mode", choices=("head", "eye"), default="head",
         help="tracking source: head pose (default) or iris gaze",
     )
@@ -1383,11 +1705,12 @@ def main(argv: list[str] | None = None) -> int:
         "fit" if args.calibrate else "auto"
     )
     log.info(
-        "Startup config: mode=%s gain=(%.1f, %.1f) eye_gain=(%.1f, %.1f) "
+        "Startup config: engine=%s mode=%s gain=(%.1f, %.1f) "
+        "eye_gain=(%.1f, %.1f) "
         "dwell=%.2fs/%.0fpx one_euro=(min_cutoff=%.2f, beta=%.3f) "
         "camera=%d window=%s debug=%s record=%s calib=%s "
         "snapshots=%s snap_interval=%.1fs session=%s",
-        args.mode, GAIN_X, GAIN_Y, EYE_GAIN_X, EYE_GAIN_Y,
+        args.engine, args.mode, GAIN_X, GAIN_Y, EYE_GAIN_X, EYE_GAIN_Y,
         DWELL_TIME, DWELL_RADIUS, MIN_CUTOFF, BETA,
         CAMERA_INDEX, not args.no_window, args.debug,
         args.record, calib_state,
@@ -1403,6 +1726,7 @@ def main(argv: list[str] | None = None) -> int:
         calibrate_on_start=args.calibrate,
         snapshots=snapshots,
         snap_interval=args.snap_interval,
+        engine=args.engine,
     )
 
     def handle_sigint(_signum, _frame):
