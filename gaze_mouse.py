@@ -1431,7 +1431,9 @@ class GazeMouse:
                 now = time.time()
                 self.update_fps(now)
 
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                # eyeGestures' face.py does its own BGR->RGB conversion, so it
+                # expects a raw BGR frame here; converting first double-converts
+                # and breaks face detection.
                 self.frame_idx += 1
 
                 target: tuple[float, float] | None = None
@@ -1443,7 +1445,7 @@ class GazeMouse:
 
                 try:
                     event, calibration = tracker.step(
-                        rgb, self._eg_calibrating,
+                        frame, self._eg_calibrating,
                         int(self.screen_w), int(self.screen_h),
                     )
                 except Exception:  # noqa: BLE001 - a bad frame must not kill the loop
@@ -1479,16 +1481,26 @@ class GazeMouse:
                         )
 
                 if event is not None and not self._eg_calibrating:
-                    raw_x, raw_y = self._eyegestures_target(event)
-                    target = (raw_x, raw_y)
-                    sx = self.filter_x(raw_x, now)
-                    sy = self.filter_y(raw_y, now)
-                    cursor = (sx, sy)
+                    # A transient no-face frame can yield a None/empty point;
+                    # skip warping the cursor and log a throttled debug line.
+                    point = getattr(event, "point", None)
+                    if point is None or len(point) < 2:
+                        if self.frame_idx % 30 == 0:
+                            log.debug(
+                                "eyeGestures: no gaze point this frame "
+                                "(no face detected)"
+                            )
+                    else:
+                        raw_x, raw_y = self._eyegestures_target(event)
+                        target = (raw_x, raw_y)
+                        sx = self.filter_x(raw_x, now)
+                        sy = self.filter_y(raw_y, now)
+                        cursor = (sx, sy)
 
-                    if self.control_enabled:
-                        warp_cursor(sx, sy)
-                    progress, clicked = self.update_dwell(sx, sy, now)
-                    self.periodic_log(now, 0.0, 0.0, sx, sy)
+                        if self.control_enabled:
+                            warp_cursor(sx, sy)
+                        progress, clicked = self.update_dwell(sx, sy, now)
+                        self.periodic_log(now, 0.0, 0.0, sx, sy)
 
                 # Annotate (HUD + minimap + calibration target). Face bbox / iris
                 # dots are skipped here: the lib does not expose a matching
