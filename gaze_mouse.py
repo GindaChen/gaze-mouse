@@ -24,10 +24,14 @@ Keys (in the preview window):
     m      toggle tracking mode (head <-> eye)
     k      run the 9-point eye-gaze calibration (recalibrate anytime)
 
-Debug artifacts (written to debug/):
-    --record         start webcam recording immediately (also key 'r')
-    --trace          write a per-frame JSONL trace
-The recorded webcam video is a local file only; nothing is uploaded.
+Debug artifacts (written to debug/session-<timestamp>/):
+    session.log      this run's full log, isolated to the session folder
+    trace.jsonl      per-frame JSONL trace (always on)
+    recording.mp4    annotated preview video (only with --record / key 'r')
+    frames/          annotated camera snapshots (periodic + on dwell-click)
+    meta.json        written on close (graceful shutdown or SIGINT)
+The recorded webcam video and snapshots are local files only; nothing is
+uploaded. The eye calibration profile stays shared at debug/eye_calibration.json.
 """
 
 from __future__ import annotations
@@ -35,14 +39,11 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import logging.handlers
 import math
 import os
 import signal
 import sys
 import time
-import urllib.request
-from datetime import datetime
 
 import cv2
 import numpy as np
@@ -92,6 +93,17 @@ DEBUG_DIR_NAME = "debug"
 DEFAULT_FPS = 20.0            # fallback recording fps before fps is measured
 TRACE_FLUSH_INTERVAL = 1.0    # seconds between trace file flushes
 
+# Per-session debug output. Each run owns one debug/session-<ts>/ folder holding
+# its log, trace, optional recording, snapshot frames and a meta.json summary.
+SESSION_PREFIX = "session-"
+SESSION_TS_FORMAT = "%Y%m%d-%H%M%S"
+SESSION_LOG_NAME = "session.log"
+TRACE_NAME = "trace.jsonl"
+RECORDING_NAME = "recording.mp4"
+FRAMES_DIR_NAME = "frames"
+META_NAME = "meta.json"
+DEFAULT_SNAP_INTERVAL = 3.0   # seconds between periodic camera snapshots
+
 MINIMAP_W = 240              # px, on-frame screen minimap width
 MINIMAP_H = 150             # px, on-frame screen minimap height
 MINIMAP_MARGIN = 12         # px, gap from the frame edge
@@ -106,7 +118,6 @@ CALIB_MIN_POINTS = 6         # minimum good targets required to fit a model
 CALIB_FEATURE_ORDER = ["1", "gx", "gy", "gx2", "gy2", "gxgy"]
 
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
-LOG_PATH = os.path.join(PROJECT_DIR, "gaze_mouse.log")
 MODEL_PATH = os.path.join(PROJECT_DIR, MODEL_FILENAME)
 DEBUG_DIR = os.path.join(PROJECT_DIR, DEBUG_DIR_NAME)
 CALIB_PATH = os.path.join(DEBUG_DIR, CALIB_FILENAME)
@@ -115,10 +126,34 @@ log = logging.getLogger("gaze_mouse")
 
 
 # --------------------------------------------------------------------------- #
+# Session: one debug folder per run
+# --------------------------------------------------------------------------- #
+class Session:
+    """Owns one debug/session-<ts>/ folder and the paths inside it.
+
+    Created at startup. The folder and its frames/ subdirectory are made
+    eagerly so every artifact (log, trace, recording, snapshots, meta) lands
+    in the same isolated place. The shared eye_calibration.json deliberately
+    stays at the debug/ root and is NOT part of a session.
+    """
+
+    def __init__(self, debug_dir: str = DEBUG_DIR, stamp: str | None = None) -> None:
+        self.stamp = stamp or time.strftime(SESSION_TS_FORMAT)
+        self.dir = os.path.join(debug_dir, f"{SESSION_PREFIX}{self.stamp}")
+        self.frames_dir = os.path.join(self.dir, FRAMES_DIR_NAME)
+        os.makedirs(self.frames_dir, exist_ok=True)
+
+        self.log_path = os.path.join(self.dir, SESSION_LOG_NAME)
+        self.trace_path = os.path.join(self.dir, TRACE_NAME)
+        self.recording_path = os.path.join(self.dir, RECORDING_NAME)
+        self.meta_path = os.path.join(self.dir, META_NAME)
+
+
+# --------------------------------------------------------------------------- #
 # Logging
 # --------------------------------------------------------------------------- #
-def setup_logging(debug: bool) -> None:
-    """Configure logging to both stdout and a rotating file with timestamps."""
+def setup_logging(debug: bool, log_path: str) -> None:
+    """Configure logging to both stdout and this session's log file."""
     level = logging.DEBUG if debug else logging.INFO
     fmt = logging.Formatter(
         "%(asctime)s %(levelname)-7s %(message)s", datefmt="%H:%M:%S"
@@ -132,9 +167,7 @@ def setup_logging(debug: bool) -> None:
     stream.setLevel(level)
     log.addHandler(stream)
 
-    file_handler = logging.handlers.RotatingFileHandler(
-        LOG_PATH, maxBytes=1_000_000, backupCount=3
-    )
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
     file_handler.setFormatter(fmt)
     file_handler.setLevel(level)
     log.addHandler(file_handler)
@@ -298,14 +331,13 @@ class Recorder:
     """Lazily-initialized cv2.VideoWriter for annotated preview frames.
 
     The writer is created on the first written frame so its size is known.
-    Records to debug/session-<timestamp>.mp4 with the mp4v fourcc. The video
-    is a LOCAL FILE ONLY; nothing leaves the machine.
+    Records to the session folder's recording.mp4 with the mp4v fourcc. The
+    video is a LOCAL FILE ONLY; nothing leaves the machine.
     """
 
-    def __init__(self, debug_dir: str = DEBUG_DIR, fps: float | None = None) -> None:
-        os.makedirs(debug_dir, exist_ok=True)
-        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        self.path = os.path.join(debug_dir, f"session-{stamp}.mp4")
+    def __init__(self, path: str, fps: float | None = None) -> None:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        self.path = path
         self._fps = fps
         self._writer: cv2.VideoWriter | None = None
         self._size: tuple[int, int] | None = None
@@ -348,13 +380,12 @@ class Recorder:
 class Tracer:
     """Newline-delimited JSON trace, one object per processed frame.
 
-    Writes to debug/trace-<timestamp>.jsonl and flushes periodically.
+    Writes to the session folder's trace.jsonl and flushes periodically.
     """
 
-    def __init__(self, debug_dir: str = DEBUG_DIR) -> None:
-        os.makedirs(debug_dir, exist_ok=True)
-        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        self.path = os.path.join(debug_dir, f"trace-{stamp}.jsonl")
+    def __init__(self, path: str) -> None:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        self.path = path
         self._fh = open(self.path, "w", encoding="utf-8")
         self.line_count = 0
         self._last_flush = time.time()
@@ -377,6 +408,54 @@ class Tracer:
                 "Stopped JSONL trace: %s (%d lines)",
                 self.path, self.line_count,
             )
+
+
+# --------------------------------------------------------------------------- #
+# Debug: annotated camera snapshots
+# --------------------------------------------------------------------------- #
+class Snapshotter:
+    """Saves annotated BGR frames as PNGs into the session frames/ folder.
+
+    Two triggers: periodic (every `interval` seconds) and on-click (one per
+    dwell-click, filename prefixed `click-`). Filenames embed a monotonically
+    increasing sequence and the elapsed seconds since the snapshotter started.
+    The interval is the only throttle, which keeps the periodic stream bounded.
+    """
+
+    def __init__(self, frames_dir: str, interval: float = DEFAULT_SNAP_INTERVAL) -> None:
+        os.makedirs(frames_dir, exist_ok=True)
+        self.frames_dir = frames_dir
+        self.interval = float(interval)
+        self.count = 0
+        self._seq = 0
+        self._start = time.time()
+        self._last_periodic = 0.0  # force a snapshot on the first frame
+        self._logged_first = False
+
+    def _save(self, frame: np.ndarray, now: float, prefix: str) -> str:
+        self._seq += 1
+        elapsed = now - self._start
+        name = f"{prefix}-{self._seq:05d}-t{elapsed:.1f}s.png"
+        path = os.path.join(self.frames_dir, name)
+        cv2.imwrite(path, frame)
+        self.count += 1
+        if not self._logged_first:
+            self._logged_first = True
+            log.info("First snapshot saved: %s", path)
+        return path
+
+    def maybe_periodic(self, frame: np.ndarray, now: float) -> None:
+        """Save a periodic frame if the interval has elapsed."""
+        if now - self._last_periodic >= self.interval:
+            self._last_periodic = now
+            self._save(frame, now, "frame")
+
+    def on_click(self, frame: np.ndarray, now: float) -> str:
+        """Save a snapshot for a dwell-click; does not affect periodic timing."""
+        return self._save(frame, now, "click")
+
+    def close(self) -> None:
+        log.info("Snapshots saved: %d (%s)", self.count, self.frames_dir)
 
 
 # --------------------------------------------------------------------------- #
@@ -610,16 +689,20 @@ class GazeMouse:
 
     def __init__(
         self,
+        session: Session,
         show_window: bool,
         record: bool = False,
-        trace: bool = False,
         mode: str = "head",
         use_calib: bool = True,
         calibrate_on_start: bool = False,
+        snapshots: bool = True,
+        snap_interval: float = DEFAULT_SNAP_INTERVAL,
     ) -> None:
+        self.session = session
         self.show_window = show_window
         self.mode = mode  # "head" or "eye"
         self.screen_w, self.screen_h = get_screen_size()
+        self.start_wall = time.time()
 
         # Eye-gaze calibration model (fitted iris->pixel map). When present it
         # replaces the neutral+gain mapping for eye mode.
@@ -632,12 +715,27 @@ class GazeMouse:
         elif load_calibration() is not None:
             log.info("Eye calibration present but ignored (--no-calib)")
 
-        # debug recording / tracing
+        # debug recording / tracing / snapshots
         self.record_requested = record
-        self.trace_enabled = trace
+        self.snapshots_enabled = snapshots
+        self.snap_interval = snap_interval
         self.recorder: Recorder | None = None
         self.tracer: Tracer | None = None
+        self.snapshotter: Snapshotter | None = None
         self.frame_idx = 0
+        self.click_count = 0
+        self.modes_used: set[str] = {mode}
+
+        # Flags recorded into meta.json. Set by main() before run().
+        self.flags: dict = {
+            "window": show_window,
+            "record": record,
+            "mode": mode,
+            "use_calib": use_calib,
+            "calibrate_on_start": calibrate_on_start,
+            "snapshots": snapshots,
+            "snap_interval": snap_interval,
+        }
 
         self.filter_x = OneEuroFilter()
         self.filter_y = OneEuroFilter()
@@ -689,6 +787,7 @@ class GazeMouse:
 
     def toggle_mode(self) -> None:
         self.mode = "eye" if self.mode == "head" else "head"
+        self.modes_used.add(self.mode)
         self.filter_x = OneEuroFilter()
         self.filter_y = OneEuroFilter()
         log.info("Tracking mode switched to %s", self.mode.upper())
@@ -701,7 +800,7 @@ class GazeMouse:
     def toggle_recording(self) -> None:
         if self.recorder is None:
             fps = self._fps if self._fps > 0 else None
-            self.recorder = Recorder(fps=fps)
+            self.recorder = Recorder(self.session.recording_path, fps=fps)
         else:
             self.recorder.close()
             self.recorder = None
@@ -790,6 +889,7 @@ class GazeMouse:
             self.dwell_armed = False  # require leaving radius before re-firing
             self.dwell_start = now
             clicked = True
+            self.click_count += 1
             log.info("Dwell-click at (%.0f, %.0f)", x, y)
         return progress, clicked
 
@@ -834,6 +934,7 @@ class GazeMouse:
         )
         if self.mode == "eye":
             line += f" | calib {'on' if self.calib_active() else 'off'}"
+        line += f" | snap {'on' if self.snapshots_enabled else 'off'}"
         cv2.putText(
             frame, line, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
             (0, 255, 255), 2, cv2.LINE_AA,
@@ -1034,12 +1135,16 @@ class GazeMouse:
         cam_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         log.info("Camera opened: %dx%d", cam_w, cam_h)
         log.info("Screen size: %.0fx%.0f", self.screen_w, self.screen_h)
+        log.info("Session folder: %s", self.session.dir)
         log.info("Cursor control starts OFF; press space to enable.")
 
-        if self.trace_enabled:
-            self.tracer = Tracer()
+        self.tracer = Tracer(self.session.trace_path)
         if self.record_requested:
-            self.recorder = Recorder(fps=None)
+            self.recorder = Recorder(self.session.recording_path, fps=None)
+        if self.snapshots_enabled:
+            self.snapshotter = Snapshotter(
+                self.session.frames_dir, interval=self.snap_interval
+            )
 
         if self.calibrate_on_start and self.show_window:
             self.run_calibration(cap, landmarker)
@@ -1108,9 +1213,14 @@ class GazeMouse:
                     self.periodic_log(now, yaw, pitch, sx, sy)
 
                 # Build the annotated frame (HUD + face dot + minimap). This is
-                # the same BGR frame shown in the window and fed to the recorder,
-                # so it is built even in --no-window mode when recording.
-                annotate = self.show_window or self.recorder is not None
+                # the same BGR frame shown in the window, fed to the recorder and
+                # saved as snapshots, so it is built even in --no-window mode
+                # whenever any consumer needs it.
+                annotate = (
+                    self.show_window
+                    or self.recorder is not None
+                    or self.snapshotter is not None
+                )
                 if annotate:
                     if landmarks is not None:
                         self.draw_face_overlay(frame, landmarks, cam_w, cam_h)
@@ -1122,6 +1232,11 @@ class GazeMouse:
 
                 if self.recorder is not None:
                     self.recorder.write(frame)
+
+                if self.snapshotter is not None:
+                    if clicked:
+                        self.snapshotter.on_click(frame, now)
+                    self.snapshotter.maybe_periodic(frame, now)
 
                 if self.tracer is not None:
                     self.tracer.write({
@@ -1168,8 +1283,45 @@ class GazeMouse:
             if self.tracer is not None:
                 self.tracer.close()
                 self.tracer = None
+            if self.snapshotter is not None:
+                self.snapshotter.close()
+            self.write_meta()
             landmarker.close()
             log.info("Shut down cleanly")
+
+    # -- meta -------------------------------------------------------------- #
+    def write_meta(self) -> str:
+        """Write meta.json summarizing the session. Idempotent and crash-safe."""
+        end = time.time()
+        duration = end - self.start_wall
+        snap_count = self.snapshotter.count if self.snapshotter else 0
+        mean_fps = self.frame_idx / duration if duration > 0 else 0.0
+        meta = {
+            "start": time.strftime(
+                "%Y-%m-%dT%H:%M:%S", time.localtime(self.start_wall)
+            ),
+            "end": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(end)),
+            "duration_s": round(duration, 2),
+            "frames": self.frame_idx,
+            "mean_fps": round(mean_fps, 2),
+            "screen_w": int(self.screen_w),
+            "screen_h": int(self.screen_h),
+            "modes_used": sorted(self.modes_used),
+            "calibration_active": self.calib_active(),
+            "calibration_points": (
+                self.calib_model.get("points", 0) if self.calib_model else 0
+            ),
+            "dwell_clicks": self.click_count,
+            "snapshots": snap_count,
+            "flags": dict(self.flags),
+        }
+        try:
+            with open(self.session.meta_path, "w", encoding="utf-8") as fh:
+                json.dump(meta, fh, indent=2)
+            log.info("Wrote session meta: %s", self.session.meta_path)
+        except OSError as exc:
+            log.warning("Could not write meta.json: %s", exc)
+        return self.session.meta_path
 
 
 # --------------------------------------------------------------------------- #
@@ -1188,11 +1340,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--record", action="store_true",
-        help="record the annotated preview to debug/session-*.mp4 (local file)",
+        help="record the annotated preview to the session's recording.mp4",
     )
     parser.add_argument(
         "--trace", action="store_true",
-        help="write a per-frame JSONL trace to debug/trace-*.jsonl",
+        help="deprecated no-op; the per-frame trace.jsonl is always written",
+    )
+    parser.add_argument(
+        "--no-snapshots", action="store_true",
+        help="disable periodic + on-click camera snapshots (default: enabled)",
+    )
+    parser.add_argument(
+        "--snap-interval", type=float, default=DEFAULT_SNAP_INTERVAL,
+        help="seconds between periodic camera snapshots (default: %(default)s)",
     )
     parser.add_argument(
         "--mode", choices=("head", "eye"), default="head",
@@ -1211,8 +1371,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    setup_logging(args.debug)
+    session = Session()
+    setup_logging(args.debug, session.log_path)
 
+    if args.trace:
+        log.info("--trace is deprecated; trace.jsonl is always written now")
+
+    snapshots = not args.no_snapshots
     use_calib = not args.no_calib
     calib_state = "off" if args.no_calib else (
         "fit" if args.calibrate else "auto"
@@ -1220,20 +1385,24 @@ def main(argv: list[str] | None = None) -> int:
     log.info(
         "Startup config: mode=%s gain=(%.1f, %.1f) eye_gain=(%.1f, %.1f) "
         "dwell=%.2fs/%.0fpx one_euro=(min_cutoff=%.2f, beta=%.3f) "
-        "camera=%d window=%s debug=%s record=%s trace=%s calib=%s",
+        "camera=%d window=%s debug=%s record=%s calib=%s "
+        "snapshots=%s snap_interval=%.1fs session=%s",
         args.mode, GAIN_X, GAIN_Y, EYE_GAIN_X, EYE_GAIN_Y,
         DWELL_TIME, DWELL_RADIUS, MIN_CUTOFF, BETA,
         CAMERA_INDEX, not args.no_window, args.debug,
-        args.record, args.trace, calib_state,
+        args.record, calib_state,
+        snapshots, args.snap_interval, session.dir,
     )
 
     app = GazeMouse(
+        session=session,
         show_window=not args.no_window,
         record=args.record,
-        trace=args.trace,
         mode=args.mode,
         use_calib=use_calib,
         calibrate_on_start=args.calibrate,
+        snapshots=snapshots,
+        snap_interval=args.snap_interval,
     )
 
     def handle_sigint(_signum, _frame):

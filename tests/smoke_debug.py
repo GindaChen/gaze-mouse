@@ -11,7 +11,9 @@ Run:
 from __future__ import annotations
 
 import os
+import shutil
 import sys
+import tempfile
 
 import numpy as np
 
@@ -24,8 +26,9 @@ def main() -> int:
     screen_w, screen_h = 2560.0, 1600.0
     n_frames = 8
 
-    rec = Recorder(fps=20.0)
-    tracer = Tracer()
+    tmp = tempfile.mkdtemp(prefix="smoke_debug_")
+    rec = Recorder(os.path.join(tmp, "recording.mp4"), fps=20.0)
+    tracer = Tracer(os.path.join(tmp, "trace.jsonl"))
 
     for i in range(n_frames):
         # Synthetic 640x480 BGR frame with a moving gradient so it is non-trivial.
@@ -73,6 +76,8 @@ def main() -> int:
     print("SMOKE PASS")
     print(f"  mp4:   {mp4_path} ({os.path.getsize(mp4_path)} bytes, {rec.frame_count} frames)")
     print(f"  jsonl: {jsonl_path} ({os.path.getsize(jsonl_path)} bytes, {len(lines)} lines)")
+
+    shutil.rmtree(tmp, ignore_errors=True)
     return 0
 
 

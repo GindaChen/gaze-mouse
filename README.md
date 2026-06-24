@@ -51,18 +51,20 @@ Grant both to the terminal/Python that runs this, in
 ## Run
 
 ```sh
-.venv/bin/python gaze_mouse.py            # preview window, control starts OFF
-.venv/bin/python gaze_mouse.py --debug    # DEBUG logging
-.venv/bin/python gaze_mouse.py --no-window # headless, no preview window
-.venv/bin/python gaze_mouse.py --record   # record annotated preview to debug/*.mp4
-.venv/bin/python gaze_mouse.py --trace    # per-frame JSONL trace to debug/*.jsonl
-.venv/bin/python gaze_mouse.py --mode eye # start in iris-gaze mode (default: head)
-.venv/bin/python gaze_mouse.py --calibrate # run 9-point eye calibration first
-.venv/bin/python gaze_mouse.py --no-calib  # ignore saved eye calibration profile
+.venv/bin/python gaze_mouse.py               # preview window, control starts OFF
+.venv/bin/python gaze_mouse.py --debug       # DEBUG logging
+.venv/bin/python gaze_mouse.py --no-window   # headless, no preview window
+.venv/bin/python gaze_mouse.py --record      # also record recording.mp4 in the session
+.venv/bin/python gaze_mouse.py --no-snapshots # disable periodic + on-click snapshots
+.venv/bin/python gaze_mouse.py --snap-interval 5 # seconds between periodic snapshots
+.venv/bin/python gaze_mouse.py --mode eye    # start in iris-gaze mode (default: head)
+.venv/bin/python gaze_mouse.py --calibrate   # run 9-point eye calibration first
+.venv/bin/python gaze_mouse.py --no-calib    # ignore saved eye calibration profile
 ```
 
 On first run it downloads `face_landmarker.task` into the project dir.
-Logs go to stdout and the rotating file `gaze_mouse.log`.
+Logs go to stdout and to this run's `debug/session-<timestamp>/session.log`.
+`--trace` is a deprecated no-op: the per-frame trace is always written now.
 
 ## Keys (preview window)
 
@@ -79,21 +81,48 @@ mode with `m`, press `c` to recenter the neutral for that mode (head mode) or
 
 ## Debug artifacts
 
-Debug captures land in `debug/` (created on demand):
+Every run gets **one folder per session** under `debug/`. Logs, the trace and
+snapshots are **per-session and on by default**; `--record` now nests inside the
+same folder:
 
-- `session-<timestamp>.mp4` — the annotated preview (camera + HUD + face dot +
-  screen minimap). Start with `--record` or the `r` key; works in `--no-window`
-  too. **Privacy:** this webcam video is a **local file only** — nothing is
-  uploaded anywhere.
-- `trace-<timestamp>.jsonl` — one JSON object per frame (`--trace`) with the
-  active `mode`, pose (`yaw`/`pitch`), raw iris gaze (`gaze_x`/`gaze_y`, present
-  in both modes for comparison), target/cursor coords, dwell progress, control
-  state, and click events.
+```
+debug/session-<YYYYMMDD-HHMMSS>/
+  session.log      this run's full log, isolated (no shared rotating log)
+  trace.jsonl      per-frame JSONL trace — ALWAYS ON
+  recording.mp4    annotated preview video — only with --record / key 'r'
+  frames/          annotated camera snapshots (iris dots + minimap visible)
+    frame-<seq>-t<elapsed>s.png   periodic, every --snap-interval seconds
+    click-<seq>-t<elapsed>s.png   one per dwell-click
+  meta.json        written on close (graceful shutdown or Ctrl-C)
+```
 
-- `eye_calibration.json` — the fitted per-user iris→pixel model (two polynomial
-  coefficient vectors, feature order, screen size, point count, timestamp).
-  Written by calibration (`k` / `--calibrate`) and auto-loaded on the next run
-  unless `--no-calib` is passed.
+- `session.log` — the full log for this run only. The old shared rotating
+  `gaze_mouse.log` is gone; nothing is written outside the session folder.
+- `trace.jsonl` — one JSON object per frame (always written) with the active
+  `mode`, pose (`yaw`/`pitch`), raw iris gaze (`gaze_x`/`gaze_y`, present in both
+  modes for comparison), target/cursor coords, dwell progress, control state,
+  and click events.
+- `frames/` — annotated camera snapshots (same overlays as the preview: iris
+  dots, face box, HUD, screen minimap). Saved **periodically** every
+  `--snap-interval` seconds (default `3.0`) **plus one immediately on every
+  dwell-click** (`click-` prefix). On by default; disable with `--no-snapshots`.
+- `recording.mp4` — the annotated preview video. Start with `--record` or the
+  `r` key; works in `--no-window` too.
+- `meta.json` — written on graceful shutdown and on Ctrl-C: start/end
+  timestamps, duration, total frames, mean fps, screen size, modes used,
+  calibration active + point count, dwell-click count, snapshot count, and the
+  flags used.
+
+**Privacy:** the webcam video and snapshots are **local files only** — nothing
+is uploaded anywhere.
+
+The calibration profile is **not** per-session — it stays shared at the
+`debug/` root:
+
+- `debug/eye_calibration.json` — the fitted per-user iris→pixel model (two
+  polynomial coefficient vectors, feature order, screen size, point count,
+  timestamp). Written by calibration (`k` / `--calibrate`) and auto-loaded on
+  the next run unless `--no-calib` is passed.
 
 The on-frame **screen minimap** (top-right) maps the full display, showing the
 raw target position (hollow circle) and the smoothed cursor (filled dot with a
@@ -102,9 +131,10 @@ dwell ring).
 Smoke-test the pure helpers without a camera:
 
 ```sh
-.venv/bin/python tests/smoke_debug.py   # recorder / tracer / minimap
-.venv/bin/python tests/smoke_eye.py     # eye-gaze + face-bbox math
-.venv/bin/python tests/smoke_calib.py   # calibration fit/predict math
+.venv/bin/python tests/smoke_debug.py    # recorder / tracer / minimap
+.venv/bin/python tests/smoke_eye.py      # eye-gaze + face-bbox math
+.venv/bin/python tests/smoke_calib.py    # calibration fit/predict math
+.venv/bin/python tests/smoke_session.py  # per-session folder + snapshots + meta
 ```
 
 ## Tuning knobs (top of `gaze_mouse.py`)
