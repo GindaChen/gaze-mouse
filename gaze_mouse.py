@@ -22,6 +22,7 @@ Keys (in the preview window):
     space  toggle cursor control on/off (starts OFF for safety)
     r      toggle webcam recording on/off (local file in debug/)
     m      toggle tracking mode (head <-> eye)
+    k      run the 9-point eye-gaze calibration (recalibrate anytime)
 
 Debug artifacts (written to debug/):
     --record         start webcam recording immediately (also key 'r')
@@ -95,10 +96,20 @@ MINIMAP_W = 240              # px, on-frame screen minimap width
 MINIMAP_H = 150             # px, on-frame screen minimap height
 MINIMAP_MARGIN = 12         # px, gap from the frame edge
 
+# Eye-gaze calibration: a fitted iris->pixel model replaces neutral+gain in eye
+# mode. Targets are a 3x3 grid at CALIB_MARGIN from each screen edge.
+CALIB_FILENAME = "eye_calibration.json"
+CALIB_MARGIN = 0.10          # grid target inset from each screen edge (fraction)
+CALIB_SETTLE = 0.8           # seconds to ignore at each target before sampling
+CALIB_SAMPLES = 25           # raw gaze samples collected per target
+CALIB_MIN_POINTS = 6         # minimum good targets required to fit a model
+CALIB_FEATURE_ORDER = ["1", "gx", "gy", "gx2", "gy2", "gxgy"]
+
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_PATH = os.path.join(PROJECT_DIR, "gaze_mouse.log")
 MODEL_PATH = os.path.join(PROJECT_DIR, MODEL_FILENAME)
 DEBUG_DIR = os.path.join(PROJECT_DIR, DEBUG_DIR_NAME)
+CALIB_PATH = os.path.join(DEBUG_DIR, CALIB_FILENAME)
 
 log = logging.getLogger("gaze_mouse")
 
@@ -455,6 +466,53 @@ def eye_gaze_from_landmarks(landmarks) -> tuple[float, float]:
     return gaze_x, gaze_y
 
 
+# --------------------------------------------------------------------------- #
+# Eye-gaze calibration (pure, unit-testable)
+# --------------------------------------------------------------------------- #
+def poly_features(gx: float, gy: float) -> list[float]:
+    """2nd-order feature vector for the iris->pixel regression.
+
+    Order matches CALIB_FEATURE_ORDER: [1, gx, gy, gx^2, gy^2, gx*gy].
+    """
+    return [1.0, gx, gy, gx * gx, gy * gy, gx * gy]
+
+
+def fit_calibration(samples) -> dict:
+    """Fit two least-squares polynomials mapping gaze -> screen x and y.
+
+    `samples` is a list of ((gx, gy), (sx, sy)) correspondences. Returns a
+    JSON-serializable model dict holding the two coefficient vectors, the
+    feature order, the screen size, the point count and a timestamp.
+    """
+    if not samples:
+        raise ValueError("fit_calibration needs at least one sample")
+
+    a = np.array([poly_features(gx, gy) for (gx, gy), _ in samples], dtype=np.float64)
+    bx = np.array([sx for _, (sx, _sy) in samples], dtype=np.float64)
+    by = np.array([sy for _, (_sx, sy) in samples], dtype=np.float64)
+
+    coef_x, *_ = np.linalg.lstsq(a, bx, rcond=None)
+    coef_y, *_ = np.linalg.lstsq(a, by, rcond=None)
+
+    return {
+        "feature_order": list(CALIB_FEATURE_ORDER),
+        "coef_x": [float(c) for c in coef_x],
+        "coef_y": [float(c) for c in coef_y],
+        "points": len(samples),
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+
+
+def predict_calibration(model: dict, gx: float, gy: float) -> tuple[float, float]:
+    """Predict (screen_x, screen_y) from a fitted model and a gaze sample."""
+    feats = poly_features(gx, gy)
+    coef_x = model["coef_x"]
+    coef_y = model["coef_y"]
+    x = sum(f * c for f, c in zip(feats, coef_x))
+    y = sum(f * c for f, c in zip(feats, coef_y))
+    return x, y
+
+
 def face_bbox_from_landmarks(
     landmarks, frame_w: int, frame_h: int
 ) -> tuple[int, int, int, int]:
@@ -497,6 +555,37 @@ def ensure_model() -> str:
     return MODEL_PATH
 
 
+def save_calibration(model: dict, screen_w: float, screen_h: float) -> str:
+    """Persist a fitted calibration model to debug/eye_calibration.json."""
+    os.makedirs(DEBUG_DIR, exist_ok=True)
+    record = dict(model)
+    record["screen_w"] = float(screen_w)
+    record["screen_h"] = float(screen_h)
+    with open(CALIB_PATH, "w", encoding="utf-8") as fh:
+        json.dump(record, fh, indent=2)
+    log.info(
+        "Saved eye calibration: %s (%d points, screen %.0fx%.0f)",
+        CALIB_PATH, record.get("points", 0), screen_w, screen_h,
+    )
+    return CALIB_PATH
+
+
+def load_calibration() -> dict | None:
+    """Load a saved calibration model, or None if absent / unreadable."""
+    if not os.path.exists(CALIB_PATH):
+        return None
+    try:
+        with open(CALIB_PATH, encoding="utf-8") as fh:
+            model = json.load(fh)
+    except (OSError, ValueError) as exc:
+        log.warning("Could not read calibration %s: %s", CALIB_PATH, exc)
+        return None
+    if "coef_x" not in model or "coef_y" not in model:
+        log.warning("Calibration %s missing coefficients; ignoring", CALIB_PATH)
+        return None
+    return model
+
+
 def build_landmarker():
     """Create a MediaPipe FaceLandmarker in VIDEO mode with transform output."""
     from mediapipe.tasks import python as mp_python
@@ -525,10 +614,23 @@ class GazeMouse:
         record: bool = False,
         trace: bool = False,
         mode: str = "head",
+        use_calib: bool = True,
+        calibrate_on_start: bool = False,
     ) -> None:
         self.show_window = show_window
         self.mode = mode  # "head" or "eye"
         self.screen_w, self.screen_h = get_screen_size()
+
+        # Eye-gaze calibration model (fitted iris->pixel map). When present it
+        # replaces the neutral+gain mapping for eye mode.
+        self.use_calib = use_calib
+        self.calibrate_on_start = calibrate_on_start
+        self.calib_model: dict | None = None
+        if use_calib:
+            self.calib_model = load_calibration()
+            self._log_calib_state()
+        elif load_calibration() is not None:
+            log.info("Eye calibration present but ignored (--no-calib)")
 
         # debug recording / tracing
         self.record_requested = record
@@ -619,12 +721,34 @@ class GazeMouse:
         y = clamp(ny, 0.0, 1.0) * (self.screen_h - 1)
         return x, y
 
+    def calib_active(self) -> bool:
+        """True when a fitted calibration model is loaded and enabled."""
+        return self.use_calib and self.calib_model is not None
+
+    def _log_calib_state(self) -> None:
+        """Log whether eye mapping is the fitted model or the gain fallback."""
+        if self.calib_model is not None:
+            log.info(
+                "Eye calibration ACTIVE: %d points, fitted %s (%s)",
+                self.calib_model.get("points", 0),
+                self.calib_model.get("timestamp", "?"),
+                CALIB_PATH,
+            )
+        else:
+            log.info("Eye calibration not loaded; eye mode falls back to gain")
+
     def gaze_to_screen(self, gaze_x: float, gaze_y: float) -> tuple[float, float]:
         """Map an iris-gaze offset to a clamped screen point.
 
-        Same neutral + gain + clamp pipeline as head pose, just a different
-        source signal and gain constants.
+        Uses the fitted calibration model when one is active; otherwise the
+        neutral + gain + clamp pipeline (same shape as head pose).
         """
+        if self.calib_active():
+            px, py = predict_calibration(self.calib_model, gaze_x, gaze_y)
+            x = clamp(px, 0.0, self.screen_w - 1)
+            y = clamp(py, 0.0, self.screen_h - 1)
+            return x, y
+
         dx = gaze_x - self.neutral_gaze_x
         dy = gaze_y - self.neutral_gaze_y
 
@@ -708,11 +832,13 @@ class GazeMouse:
             f"ctrl {'ON' if self.control_enabled else 'OFF'} | "
             f"dwell {int(progress * 100):3d}%"
         )
+        if self.mode == "eye":
+            line += f" | calib {'on' if self.calib_active() else 'off'}"
         cv2.putText(
             frame, line, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
             (0, 255, 255), 2, cv2.LINE_AA,
         )
-        hint = "q quit  c recenter  space toggle  r record  m mode"
+        hint = "q quit  c recenter  space toggle  r record  m mode  k calibrate"
         cv2.putText(
             frame, hint, (10, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
             (200, 200, 200), 1, cv2.LINE_AA,
@@ -754,6 +880,146 @@ class GazeMouse:
             if p is not None:
                 cv2.circle(frame, p, 3, (0, 0, 255), -1, cv2.LINE_AA)
 
+    # -- eye calibration --------------------------------------------------- #
+    def _calib_targets(self) -> list[tuple[float, float]]:
+        """3x3 grid of screen pixel targets at CALIB_MARGIN from each edge."""
+        fracs = (CALIB_MARGIN, 0.5, 1.0 - CALIB_MARGIN)
+        targets = []
+        for fy in fracs:
+            for fx in fracs:
+                targets.append((fx * (self.screen_w - 1), fy * (self.screen_h - 1)))
+        return targets
+
+    def run_calibration(self, cap, landmarker) -> bool:
+        """Run the fullscreen 9-point eye-gaze calibration.
+
+        Presents each target, settles, then collects median raw gaze samples,
+        fits a model and (on success) installs it for immediate use. Returns
+        True if a new model was fitted, False if aborted or too few points
+        (in which case the existing mapping is kept).
+        """
+        from mediapipe import Image, ImageFormat
+
+        win = "gaze-calibration"
+        cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+        cv2.setWindowProperty(win, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+
+        sw, sh = int(self.screen_w), int(self.screen_h)
+        targets = self._calib_targets()
+        samples: list[tuple[tuple[float, float], tuple[float, float]]] = []
+        aborted = False
+        log.info("Eye calibration started: %d targets", len(targets))
+
+        def read_gaze() -> tuple[float, float] | None:
+            ok, frm = cap.read()
+            if not ok:
+                return None
+            frm = cv2.flip(frm, 1)
+            rgb = cv2.cvtColor(frm, cv2.COLOR_BGR2RGB)
+            mp_image = Image(image_format=ImageFormat.SRGB, data=rgb)
+            res = landmarker.detect_for_video(mp_image, int(time.time() * 1000))
+            if not res.face_landmarks:
+                return None
+            return eye_gaze_from_landmarks(res.face_landmarks[0])
+
+        def draw_target(tx, ty, ring_frac, label):
+            canvas = np.zeros((sh, sw, 3), dtype=np.uint8)
+            cx, cy = int(tx), int(ty)
+            cv2.circle(canvas, (cx, cy), 30, (40, 40, 40), 2, cv2.LINE_AA)
+            if ring_frac > 0.0:
+                cv2.ellipse(
+                    canvas, (cx, cy), (30, 30), -90, 0,
+                    int(360 * clamp(ring_frac, 0.0, 1.0)), (0, 220, 0), 4,
+                    cv2.LINE_AA,
+                )
+            cv2.circle(canvas, (cx, cy), 10, (0, 0, 255), -1, cv2.LINE_AA)
+            cv2.putText(
+                canvas, label, (40, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                (200, 200, 200), 2, cv2.LINE_AA,
+            )
+            cv2.putText(
+                canvas, "look at the red dot   ESC abort   space skip point",
+                (40, sh - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                (150, 150, 150), 1, cv2.LINE_AA,
+            )
+            cv2.imshow(win, canvas)
+
+        for i, (tx, ty) in enumerate(targets):
+            label = f"point {i + 1}/{len(targets)}"
+            # Settle: ignore samples, show static dot.
+            settle_end = time.time() + CALIB_SETTLE
+            skip = False
+            while time.time() < settle_end:
+                read_gaze()
+                draw_target(tx, ty, 0.0, label + " (settle)")
+                key = cv2.waitKey(1) & 0xFF
+                if key == 27:
+                    aborted = True
+                    break
+                if key == ord(" "):
+                    skip = True
+                    break
+            if aborted:
+                break
+            if skip:
+                log.info("Calibration point %d skipped", i + 1)
+                continue
+
+            # Collect samples, filling a progress ring.
+            gxs: list[float] = []
+            gys: list[float] = []
+            while len(gxs) < CALIB_SAMPLES:
+                g = read_gaze()
+                if g is not None:
+                    gxs.append(g[0])
+                    gys.append(g[1])
+                draw_target(tx, ty, len(gxs) / CALIB_SAMPLES, label)
+                key = cv2.waitKey(1) & 0xFF
+                if key == 27:
+                    aborted = True
+                    break
+                if key == ord(" "):
+                    skip = True
+                    break
+            if aborted:
+                break
+            if skip or not gxs:
+                log.info("Calibration point %d skipped (no samples)", i + 1)
+                continue
+
+            med_gx = float(np.median(gxs))
+            med_gy = float(np.median(gys))
+            samples.append(((med_gx, med_gy), (tx, ty)))
+            log.info(
+                "Calib point %d: gaze=(%.3f, %.3f) -> screen=(%.0f, %.0f) "
+                "from %d samples",
+                i + 1, med_gx, med_gy, tx, ty, len(gxs),
+            )
+
+        cv2.destroyWindow(win)
+
+        if aborted:
+            log.warning("Calibration aborted (ESC); keeping previous mapping")
+            return False
+        if len(samples) < CALIB_MIN_POINTS:
+            log.warning(
+                "Calibration got %d/%d good points (<%d); keeping previous "
+                "mapping", len(samples), len(targets), CALIB_MIN_POINTS,
+            )
+            return False
+
+        model = fit_calibration(samples)
+        save_calibration(model, self.screen_w, self.screen_h)
+        self.calib_model = model
+        self.use_calib = True
+        self.filter_x = OneEuroFilter()
+        self.filter_y = OneEuroFilter()
+        log.info(
+            "Calibration complete: fitted model from %d points, now ACTIVE",
+            len(samples),
+        )
+        return True
+
     # -- main loop --------------------------------------------------------- #
     def run(self) -> None:
         landmarker = build_landmarker()
@@ -774,6 +1040,11 @@ class GazeMouse:
             self.tracer = Tracer()
         if self.record_requested:
             self.recorder = Recorder(fps=None)
+
+        if self.calibrate_on_start and self.show_window:
+            self.run_calibration(cap, landmarker)
+        elif self.calibrate_on_start:
+            log.warning("--calibrate needs the preview window; skipping")
 
         try:
             while self.running:
@@ -885,6 +1156,8 @@ class GazeMouse:
                         self.toggle_recording()
                     if key == ord("m"):
                         self.toggle_mode()
+                    if key == ord("k"):
+                        self.run_calibration(cap, landmarker)
         finally:
             cap.release()
             if self.show_window:
@@ -925,6 +1198,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--mode", choices=("head", "eye"), default="head",
         help="tracking source: head pose (default) or iris gaze",
     )
+    parser.add_argument(
+        "--calibrate", action="store_true",
+        help="run the 9-point eye-gaze calibration first, then continue",
+    )
+    parser.add_argument(
+        "--no-calib", action="store_true",
+        help="ignore any saved debug/eye_calibration.json (use gain mapping)",
+    )
     return parser.parse_args(argv)
 
 
@@ -932,14 +1213,18 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     setup_logging(args.debug)
 
+    use_calib = not args.no_calib
+    calib_state = "off" if args.no_calib else (
+        "fit" if args.calibrate else "auto"
+    )
     log.info(
         "Startup config: mode=%s gain=(%.1f, %.1f) eye_gain=(%.1f, %.1f) "
         "dwell=%.2fs/%.0fpx one_euro=(min_cutoff=%.2f, beta=%.3f) "
-        "camera=%d window=%s debug=%s record=%s trace=%s",
+        "camera=%d window=%s debug=%s record=%s trace=%s calib=%s",
         args.mode, GAIN_X, GAIN_Y, EYE_GAIN_X, EYE_GAIN_Y,
         DWELL_TIME, DWELL_RADIUS, MIN_CUTOFF, BETA,
         CAMERA_INDEX, not args.no_window, args.debug,
-        args.record, args.trace,
+        args.record, args.trace, calib_state,
     )
 
     app = GazeMouse(
@@ -947,6 +1232,8 @@ def main(argv: list[str] | None = None) -> int:
         record=args.record,
         trace=args.trace,
         mode=args.mode,
+        use_calib=use_calib,
+        calibrate_on_start=args.calibrate,
     )
 
     def handle_sigint(_signum, _frame):

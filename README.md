@@ -10,9 +10,29 @@ Two tracking modes, switchable at runtime (`m`) or at launch (`--mode`):
   calibration grid; just a one-key neutral-pose recenter.
 - **eye** — real iris gaze (appearance-based iris offset inside each eye). This
   is genuine eye tracking, but it is **jittery** and **low-resolution** (the
-  webcam iris is only a handful of pixels), so the cursor wanders more and it
-  may need a proper calibration routine later. Expect it to feel rougher than
-  head mode — that is inherent to webcam iris tracking, not a bug.
+  webcam iris is only a handful of pixels), so the cursor wanders more. Expect
+  it to feel rougher than head mode — that is inherent to webcam iris tracking,
+  not a bug. **Calibration is what makes eye mode actually land on targets**:
+  the raw iris offset is fitted to your screen with a per-user model (see
+  below), replacing the flat gain mapping.
+
+## Eye-gaze calibration
+
+The raw iris offset alone does not reach screen corners reliably. A one-time
+**9-point calibration** fits a per-user iris→pixel model that eye mode then uses
+instead of the flat gain:
+
+```sh
+.venv/bin/python gaze_mouse.py --calibrate   # calibrate first, then run
+.venv/bin/python gaze_mouse.py --no-calib    # ignore the saved profile (use gain)
+```
+
+Press `k` in the preview window to (re)calibrate at any time. A fullscreen
+window shows nine dots (a 3×3 grid at ~10% margins); look at each red dot while
+a green ring fills, `space` skips a bad point, `ESC` aborts (keeping the
+previous mapping). The fitted profile is saved to
+**`debug/eye_calibration.json`** and loaded automatically on the next run; the
+HUD shows `calib on/off` in eye mode and the startup log line reports `calib=`.
 
 A thin **face bounding box** is always drawn in the preview. In eye mode the
 preview also marks the two iris centers and the four eye corners so you can see
@@ -37,6 +57,8 @@ Grant both to the terminal/Python that runs this, in
 .venv/bin/python gaze_mouse.py --record   # record annotated preview to debug/*.mp4
 .venv/bin/python gaze_mouse.py --trace    # per-frame JSONL trace to debug/*.jsonl
 .venv/bin/python gaze_mouse.py --mode eye # start in iris-gaze mode (default: head)
+.venv/bin/python gaze_mouse.py --calibrate # run 9-point eye calibration first
+.venv/bin/python gaze_mouse.py --no-calib  # ignore saved eye calibration profile
 ```
 
 On first run it downloads `face_landmarker.task` into the project dir.
@@ -49,9 +71,11 @@ Logs go to stdout and the rotating file `gaze_mouse.log`.
 - `space` — toggle cursor control on/off (starts **OFF** for safety)
 - `r` — toggle webcam recording on/off (writes to `debug/`, local file only)
 - `m` — toggle tracking mode (head ↔ eye)
+- `k` — run the 9-point eye-gaze calibration (recalibrate anytime)
 
 Press `space` only once you see the HUD tracking correctly. After switching
-mode with `m`, press `c` to recenter the neutral for that mode.
+mode with `m`, press `c` to recenter the neutral for that mode (head mode) or
+`k` to calibrate (eye mode).
 
 ## Debug artifacts
 
@@ -66,6 +90,11 @@ Debug captures land in `debug/` (created on demand):
   in both modes for comparison), target/cursor coords, dwell progress, control
   state, and click events.
 
+- `eye_calibration.json` — the fitted per-user iris→pixel model (two polynomial
+  coefficient vectors, feature order, screen size, point count, timestamp).
+  Written by calibration (`k` / `--calibrate`) and auto-loaded on the next run
+  unless `--no-calib` is passed.
+
 The on-frame **screen minimap** (top-right) maps the full display, showing the
 raw target position (hollow circle) and the smoothed cursor (filled dot with a
 dwell ring).
@@ -75,13 +104,18 @@ Smoke-test the pure helpers without a camera:
 ```sh
 .venv/bin/python tests/smoke_debug.py   # recorder / tracer / minimap
 .venv/bin/python tests/smoke_eye.py     # eye-gaze + face-bbox math
+.venv/bin/python tests/smoke_calib.py   # calibration fit/predict math
 ```
 
 ## Tuning knobs (top of `gaze_mouse.py`)
 
 - `GAIN_X`, `GAIN_Y` — how far a given head turn/tilt moves the cursor.
-- `EYE_GAIN_X`, `EYE_GAIN_Y` — same, for iris-gaze mode (larger, since the iris
-  offset range is small). Raise to reach screen edges with less eye travel.
+- `EYE_GAIN_X`, `EYE_GAIN_Y` — same, for iris-gaze mode **when uncalibrated**
+  (larger, since the iris offset range is small). Raise to reach screen edges
+  with less eye travel. Once you calibrate (`k` / `--calibrate`) the fitted
+  model is used instead and these gains no longer apply.
+- `CALIB_MARGIN`, `CALIB_SAMPLES`, `CALIB_MIN_POINTS` — calibration grid inset,
+  samples collected per target, and minimum good points to accept a fit.
 - `DWELL_TIME`, `DWELL_RADIUS` — how long/still you must hold to fire a click.
 - `MIN_CUTOFF`, `BETA` — One-Euro filter: lower jitter vs. lower lag.
 - `CAMERA_INDEX` — webcam to use.
