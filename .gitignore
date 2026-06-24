@@ -1,0 +1,5 @@
+.venv/
+debug/
+*.log
+__pycache__/
+face_landmarker.task
